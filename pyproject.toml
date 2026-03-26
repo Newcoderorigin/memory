@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "memory-databank"
+version = "0.1.0"
+description = "Secure local memory data bank with audit integrity controls"
+readme = "README.md"
+requires-python = ">=3.13"
+authors = [{ name = "Codex" }]
+license = { text = "Proprietary" }
+
+[project.scripts]
+memory-bank = "memory_bank.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
