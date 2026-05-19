@@ -56,10 +56,8 @@ class VirtualController:
     """
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()      # guards buttons + sticks + LT
-        self._rt_lock = threading.Lock()   # guards RT only (held briefly)
+        self._lock = threading.Lock()    # guards all vpad calls
         self._pad: Optional[object] = None
-        self._rt_held: bool = False
         self._error_count: int = 0
 
         if not _VGAMEPAD_OK:
@@ -84,38 +82,44 @@ class VirtualController:
     def available(self) -> bool:
         return self._pad is not None
 
-    # ── Shot timing interface ─────────────────────────────────────────────────
+    # ── Shot button interface (X button) ─────────────────────────────────────
 
-    def hold_rt(self, value: float = 1.0) -> None:
-        """Press RT on the virtual controller (0.0–1.0)."""
-        byte_val = min(255, int(value * 255))
-        with self._rt_lock:   # RT-only lock — does not block passthrough
-            if self._pad:
-                self._pad.right_trigger(value=byte_val)
-                self._pad.update()
-                self._rt_held = True
+    def press_x(self) -> None:
+        """Press X on the virtual controller (shot button)."""
+        with self._lock:
+            if self._pad and _VGAMEPAD_OK:
+                try:
+                    import vgamepad as vg
+                    self._pad.press_button(button=vg.XUSB_BUTTON.XUSB_GAMEPAD_X)
+                    self._pad.update()
+                except Exception as exc:
+                    print(f"[VController] press_x error: {exc}")
 
-    def release_rt(self) -> None:
-        """Release RT on the virtual controller (fix #7: RT-only lock)."""
-        with self._rt_lock:   # RT-only lock — minimal contention with passthrough
-            if self._pad:
-                self._pad.right_trigger(value=0)
-                self._pad.update()
-                self._rt_held = False
+    def release_x(self) -> None:
+        """Release X on the virtual controller."""
+        with self._lock:
+            if self._pad and _VGAMEPAD_OK:
+                try:
+                    import vgamepad as vg
+                    self._pad.release_button(button=vg.XUSB_BUTTON.XUSB_GAMEPAD_X)
+                    self._pad.update()
+                except Exception as exc:
+                    print(f"[VController] release_x error: {exc}")
 
     # ── Passthrough ───────────────────────────────────────────────────────────
 
     def passthrough(
         self,
         snap: object,    # ControllerSnapshot (typed here to avoid circular import)
-        override_rt: bool = False,
+        override_x: bool = False,
         stick_noise_fn: Optional[Callable[[], float]] = None,
     ) -> None:
         """
         Mirror physical controller state to virtual controller.
 
-        override_rt=True means the shot timer owns RT — do NOT forward RT
-        from the physical controller (prevents early release from interfering).
+        override_x=True means the shot timer owns the X button — skip
+        forwarding X from physical so early physical release can't interfere
+        with the timed release.
         """
         if not self._pad:
             return
@@ -127,20 +131,19 @@ class VirtualController:
 
         with self._lock:
             try:
-                # Fix #1: incremental set/clear instead of reset() to avoid
-                # the 1-frame blank input that reset() causes each call.
+                # Incremental set/clear — no reset() to avoid 1-frame blank inputs.
+                # Skip X button (0x4000) when shot timer owns it (override_x).
                 for mask, btn in _BUTTON_MAP.items():
+                    if override_x and mask == 0x4000:
+                        continue   # shot timer controls X release timing
                     if snap.buttons & mask:  # type: ignore[attr-defined]
                         self._pad.press_button(button=btn)
                     else:
                         self._pad.release_button(button=btn)
 
-                # ── Triggers ─────────────────────────────────────────────────
-                self._pad.left_trigger(value=int(snap.lt * 255))  # type: ignore
-                if not override_rt:
-                    # RT-only lock is separate; acquire briefly to set value
-                    with self._rt_lock:
-                        self._pad.right_trigger(value=int(snap.rt * 255))  # type: ignore
+                # ── Triggers (always forwarded — RT no longer the shot button)
+                self._pad.left_trigger(value=int(snap.lt * 255))   # type: ignore
+                self._pad.right_trigger(value=int(snap.rt * 255))  # type: ignore
 
                 # ── Sticks with optional deadzone noise ───────────────────────
                 self._pad.left_joystick(

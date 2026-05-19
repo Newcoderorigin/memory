@@ -94,6 +94,11 @@ class HumanButtonResponder:
         with self._lock:
             self._dispatch_fn = fn
 
+    def update_profile(self, profile: "HBRProfile") -> None:
+        """Replace the live profile thread-safely (used by ConfigManager)."""
+        with self._lock:
+            self._profile = profile
+
     # ── Public timing helpers ─────────────────────────────────────────────────
 
     def jitter_ms(self) -> float:
