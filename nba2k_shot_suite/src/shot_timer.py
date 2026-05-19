@@ -1,15 +1,15 @@
 """
 Green-Light Shot Timer for NBA 2K26 (offline, no EAC).
 
-Intercepts the physical RT (shoot trigger) press, holds it on the virtual
-controller, then schedules release at the statistically optimal green window
-using QPC-precision timing + HBR ex-Gaussian jitter.
+Intercepts the physical X button press, holds it on the virtual controller,
+then schedules release at the statistically optimal green window using
+QPC-precision timing + HBR ex-Gaussian jitter.
 
 Flow:
-  1. Physical RT ≥ THRESHOLD detected → immediately hold RT on vpad
+  1. X button pressed (digital 0→1) → immediately hold X on vpad
   2. Timer thread counts down to release_ms (from shot profile)
   3. HBR jitter applied to release instant (ex-Gaussian, σ≈8 ms)
-  4. If physical RT released early → emergency release fires immediately
+  4. If X released early → emergency release fires immediately
 """
 from __future__ import annotations
 
@@ -88,17 +88,15 @@ PROFILES: dict[str, JumpShotProfile] = {
 
 class ShotTimingEngine:
     """
-    Monitors physical controller RT state and fires virtual RT release at the
+    Monitors the Xbox X button (digital) and fires a timed release at the
     green window, using QPC busy-wait precision and HBR jitter.
 
-    on_hold()    — called when physical RT crosses threshold; caller should
-                   press RT on the virtual controller.
-    on_release() — called at computed green window; caller should release RT
-                   on the virtual controller.
-    on_event(label) — optional UI notification (fires on main thread via after).
+    on_hold()    — called when X is pressed; caller presses X on virtual pad.
+    on_release() — called at the computed green window; caller releases X.
+    on_event(label) — optional notification callback (e.g. for web dashboard).
     """
 
-    SHOOT_THRESHOLD: float = 0.85   # RT value that triggers shot detection
+    SHOOT_BUTTON: int = 0x4000   # BTN_X — digital, no threshold needed
 
     def __init__(
         self,
@@ -124,12 +122,17 @@ class ShotTimingEngine:
         with self._lock:
             self._profile = profile
 
-    def on_snapshot(self, snap_rt: float) -> None:
+    @property
+    def shot_active(self) -> bool:
+        with self._lock:
+            return self._shot_active
+
+    def on_snapshot(self, buttons: int) -> None:
         """
-        Feed the current RT value (0.0–1.0) on each XInput poll.
-        Detects rising and falling edges.
+        Feed the current XInput button bitmask on each poll.
+        Detects X-button rising and falling edges (digital — no threshold).
         """
-        shooting = snap_rt >= self.SHOOT_THRESHOLD
+        shooting = bool(buttons & self.SHOOT_BUTTON)
 
         with self._lock:
             was_active = self._shot_active
@@ -231,7 +234,7 @@ if __name__ == "__main__":
     N = 20
     for _ in range(N):
         press_t = time.perf_counter()
-        engine.on_snapshot(1.0)
+        engine.on_snapshot(ShotTimingEngine.SHOOT_BUTTON)  # simulate X pressed
         time.sleep(profile.animation_ms / 1000.0 * 1.2)
         if releases:
             elapsed = (releases[-1] - press_t) * 1000
