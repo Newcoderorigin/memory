@@ -1,400 +1,192 @@
 """
-Real-time shot meter vision engine for NBA 2K26 (offline).
+Real-time shot meter and green window detector.
 
-Pipeline (dedicated thread, up to 240 Hz):
-  dxcam (DirectX Desktop Duplication) ─▶  ROI frame  (~3-5 ms)
-      fallback: mss (~9 ms)
-  cv2.cvtColor BGR→HSV + cv2.inRange ─▶  fill mask   (~2 ms)
-  KalmanTracker1D ─▶  smoothed fill position + velocity
-  MeterSnapshot ─▶  consumed by ShotMeterController
+NBA 2K26 shot meter anatomy (from screenshots):
+  - A white/light-gray curved arc appears to the left of the player
+  - As the animation plays, a fill colour travels along the arc
+  - A bright green indicator marks the optimal release zone (green window)
+  - "Excellent" / "Slightly Early" / "Late" text appears above the player
+    on shot completion
 
-Detection heuristic:
-  The shot meter is a vertical bar. The fill rises from bottom to top.
-  Any pixel with brightness (HSV Value) above fill_v_threshold is
-  considered fill.  The topmost such row determines fill percentage.
-  When the fill enters the green zone it turns bright green — the
-  green_hsv bounds detect that separately.
-
-Coordinate convention:
-  ROI is specified as (left, top, right, bottom) pixel coordinates
-  on the primary display (dxcam native format).  mss uses the same
-  region after internal conversion.
+Detection pipeline (per frame, runs at 60–120 FPS):
+  1. Grab BGR frame from ScreenCapture
+  2. Convert to HSV
+  3. Green-mask  → isolate green window pixels
+  4. White-mask  → isolate meter arc fill
+  5. Result-mask → detect outcome text region (green colour, upper frame)
+  6. Estimate fill_pct from topmost white pixel row
+  7. Estimate green_window_pct from centroid of green region
 """
 from __future__ import annotations
 
-import threading
 import time
+import threading
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Callable
 
 import numpy as np
-
-# ── Optional imports (graceful degradation) ───────────────────────────────────
-try:
-    import dxcam
-    _DXCAM_OK = True
-except ImportError:
-    _DXCAM_OK = False
 
 try:
     import cv2
     _CV2_OK = True
-    # Enable OpenCL (AMD RX 580 / any GPU with OpenCL 2.0)
-    cv2.ocl.setUseOpenCL(True)
-    _OCL_OK = cv2.ocl.haveOpenCL()
-    if _OCL_OK:
-        _OCL_DEVICE = cv2.ocl.Device.getDefault().name()
-    else:
-        _OCL_DEVICE = "none"
 except ImportError:
     _CV2_OK = False
-    _OCL_OK = False
-    _OCL_DEVICE = "none"
+    print("[MeterDetector] opencv-python not installed. Run: pip install opencv-python")
 
-try:
-    import mss
-    _MSS_OK = True
-except ImportError:
-    _MSS_OK = False
+from .screen_capture import ScreenCapture
 
+# ── HSV colour ranges ─────────────────────────────────────────────────────────
+# Bright green (shot meter green window indicator)
+_GREEN_LO = np.array([38,  110, 100], dtype=np.uint8)
+_GREEN_HI = np.array([88,  255, 255], dtype=np.uint8)
 
-@dataclass
-class MeterConfig:
-    """All tunable parameters for shot meter detection."""
-    roi: tuple[int, int, int, int] = (860, 600, 1060, 900)
-    # (left, top, right, bottom) — default: centre-bottom, adjust per resolution
+# White / very light gray (meter arc body + fill)
+_WHITE_LO = np.array([0,   0,  195], dtype=np.uint8)
+_WHITE_HI = np.array([180, 35, 255], dtype=np.uint8)
 
-    # Brightness threshold — pixels above this are considered "fill"
-    fill_v_threshold: int = 100   # HSV Value channel, 0-255
+# "Excellent" result text (slightly different green, rendered with anti-alias)
+_RESULT_LO = np.array([38,  70, 140], dtype=np.uint8)
+_RESULT_HI = np.array([92, 255, 255], dtype=np.uint8)
 
-    # Green zone HSV bounds (when fill turns green inside the green window)
-    green_h_lo: int = 45
-    green_h_hi: int = 95
-    green_s_lo: int = 60
-    green_v_lo: int = 60
-
-    # Kalman process noise / measurement noise
-    kalman_Q: float = 0.02   # larger → trusts measurements more
-    kalman_R: float = 4.0    # larger → smoother but laggier
-
-    # Total display→CPU→USB→game latency to pre-compensate (ms)
-    latency_ms: float = 8.0
-
-    # Minimum fill-pixel column fraction required to confirm a row is "filled"
-    min_col_fraction: float = 0.25
-
-    # Poll rate target (Hz); actual rate depends on capture backend
-    target_hz: int = 240
-
-    def roi_mss(self) -> dict[str, int]:
-        """Convert to mss monitor dict."""
-        l, t, r, b = self.roi
-        return {"left": l, "top": t, "width": r - l, "height": b - t}
+# Minimum pixel counts to consider a detection valid
+_MIN_GREEN_PX  = 25
+_MIN_WHITE_PX  = 80
+_MIN_RESULT_PX = 45
 
 
 @dataclass
-class MeterSnapshot:
-    """Output from one detection frame."""
-    fill_pct: float                 # 0.0 (empty) → 1.0 (full)
-    velocity_pct_per_ms: float      # fill speed (% per ms); Kalman-smoothed
-    fill_detected: bool             # fill bar found in ROI
-    green_detected: bool            # fill currently in green zone
-    timestamp: float                # time.perf_counter() of capture
-
-    def predict_ms_to(self, target_pct: float) -> float:
-        """
-        Estimate ms until fill reaches target_pct.
-        Returns inf if fill is not moving or already past target.
-        """
-        if not self.fill_detected or self.velocity_pct_per_ms <= 0.0:
-            return float("inf")
-        gap = target_pct - self.fill_pct
-        if gap <= 0.0:
-            return 0.0
-        return gap / self.velocity_pct_per_ms
-
-
-class KalmanTracker1D:
-    """
-    Constant-velocity 1D Kalman filter.
-    State vector: [position, velocity]
-
-    Adapted from Welch & Bishop (2006) "An Introduction to the Kalman Filter".
-    Manual numpy — no external filterpy dependency.
-    """
-
-    def __init__(self, Q: float = 0.02, R: float = 4.0) -> None:
-        self.Q_base = Q
-        self.R = R
-        self.x = np.array([0.0, 0.0])          # [pos, vel]
-        self.P = np.eye(2) * 10.0              # initial covariance (high uncertainty)
-        self._last_t: Optional[float] = None
-        self._initialized = False
-
-    def reset(self) -> None:
-        self.x = np.array([0.0, 0.0])
-        self.P = np.eye(2) * 10.0
-        self._last_t = None
-        self._initialized = False
-
-    def update(self, measurement: float, t: float) -> tuple[float, float]:
-        """
-        Feed a new fill_pct measurement at time t (perf_counter seconds).
-        Returns (smoothed_position, velocity_per_second).
-        """
-        if not self._initialized or self._last_t is None:
-            self.x[0] = measurement
-            self.x[1] = 0.0
-            self._last_t = t
-            self._initialized = True
-            return float(self.x[0]), float(self.x[1])
-
-        dt = t - self._last_t
-        if dt <= 0.0:
-            return float(self.x[0]), float(self.x[1])
-        self._last_t = t
-
-        # State transition
-        F = np.array([[1.0, dt], [0.0, 1.0]])
-        dt2, dt3, dt4 = dt * dt, dt ** 3, dt ** 4
-        Q = np.array([
-            [dt4 / 4, dt3 / 2],
-            [dt3 / 2, dt2],
-        ]) * self.Q_base
-
-        # H is 1D so matrix products stay 1D (avoids shape-mismatch with (2,1) K)
-        H = np.array([1.0, 0.0])
-
-        x_pred = F @ self.x                          # (2,)
-        P_pred = F @ self.P @ F.T + Q               # (2,2)
-
-        innov = measurement - float(H @ x_pred)      # scalar
-        S = float(H @ P_pred @ H) + self.R           # scalar
-        K = (P_pred @ H) / S                         # (2,)
-
-        self.x = x_pred + K * innov                  # (2,)
-        self.P = (np.eye(2) - np.outer(K, H)) @ P_pred  # (2,2)
-
-        return float(self.x[0]), float(self.x[1])
-
-    @property
-    def velocity_per_ms(self) -> float:
-        """Kalman-smoothed fill velocity in % per millisecond."""
-        return float(self.x[1]) / 1000.0   # convert per-sec → per-ms
+class DetectionResult:
+    timestamp:            float = field(default_factory=time.perf_counter)
+    meter_found:          bool  = False
+    green_window_visible: bool  = False
+    green_window_pct:     float = 0.0   # position of green window on arc (0=start, 1=end)
+    fill_pct:             float = 0.0   # current animation fill (0=empty, 1=full)
+    outcome_detected:     bool  = False # "Excellent" / result text visible
+    confidence:           float = 0.0   # [0,1] based on pixel count
+    debug_frame:          Optional[np.ndarray] = field(default=None, compare=False)
 
 
 class MeterDetector:
     """
-    Captures the shot meter ROI and continuously tracks fill position.
+    Detects the shot meter fill level and green window position in real time.
 
-    Thread-safe: call get_snapshot() from any thread.
-    Call start() / stop() once per session.
+    Designed to run at 60+ FPS; each detect() call is ~2–4 ms on a modern CPU
+    when the capture region is ~520×480 pixels.
     """
 
-    def __init__(self, config: Optional[MeterConfig] = None) -> None:
-        self._cfg = config or MeterConfig()
-        self._lock = threading.Lock()
-        self._snapshot = MeterSnapshot(
-            fill_pct=0.0,
-            velocity_pct_per_ms=0.0,
-            fill_detected=False,
-            green_detected=False,
-            timestamp=time.perf_counter(),
-        )
-        self._kalman = KalmanTracker1D(Q=self._cfg.kalman_Q, R=self._cfg.kalman_R)
-        self._running = False
-        self._thread: Optional[threading.Thread] = None
-
-        # Backend selection
-        self._backend: str = "none"
-        self._camera: Optional[object] = None
-        self._mss_ctx: Optional[object] = None
-
-    # ── Configuration (hot-swap safe) ─────────────────────────────────────────
-
-    def update_config(self, cfg: MeterConfig) -> None:
-        """Replace config while detector is running (thread-safe)."""
-        with self._lock:
-            self._cfg = cfg
-            self._kalman = KalmanTracker1D(Q=cfg.kalman_Q, R=cfg.kalman_R)
-
-    def get_config(self) -> MeterConfig:
-        with self._lock:
-            return self._cfg
-
-    # ── Snapshot API ──────────────────────────────────────────────────────────
-
-    def get_snapshot(self) -> MeterSnapshot:
-        with self._lock:
-            return self._snapshot
+    def __init__(
+        self,
+        capture: ScreenCapture,
+        debug:   bool = False,
+        on_result: Optional[Callable[[DetectionResult], None]] = None,
+    ) -> None:
+        self._cap       = capture
+        self._debug     = debug
+        self._on_result = on_result
+        self._lock      = threading.Lock()
+        self._latest    = DetectionResult()
+        self._running   = False
 
     @property
-    def backend(self) -> str:
-        return self._backend
+    def latest(self) -> DetectionResult:
+        with self._lock:
+            return self._latest
 
-    # ── Lifecycle ─────────────────────────────────────────────────────────────
+    # ── Single-frame detection ────────────────────────────────────────────────
 
-    def start(self) -> bool:
-        """
-        Initialise capture backend and start the poll thread.
-        Returns True if a working backend was found.
-        """
+    def detect(self) -> DetectionResult:
+        """Grab one frame and run the full detection pipeline."""
         if not _CV2_OK:
-            print("[MeterDetector] cv2 not installed — vision mode disabled.")
-            return False
-
-        if _OCL_OK:
-            print(f"[MeterDetector] GPU OpenCL enabled — {_OCL_DEVICE}")
-        else:
-            print("[MeterDetector] OpenCL unavailable — running CPU-only")
-
-        if _DXCAM_OK:
+            return DetectionResult()
+        frame = self._cap.grab()
+        if frame is None:
+            return DetectionResult()
+        result = self._analyze(frame)
+        with self._lock:
+            self._latest = result
+        if self._on_result:
             try:
-                self._camera = dxcam.create(output_color="BGR")
-                self._backend = "dxcam"
-                print("[MeterDetector] Backend: dxcam (DirectX Desktop Duplication)")
-            except Exception as exc:
-                print(f"[MeterDetector] dxcam init failed ({exc}); trying mss…")
+                self._on_result(result)
+            except Exception:
+                pass
+        return result
 
-        if self._backend == "none" and _MSS_OK:
-            try:
-                self._mss_ctx = mss.mss()
-                self._backend = "mss"
-                print("[MeterDetector] Backend: mss (fallback)")
-            except Exception as exc:
-                print(f"[MeterDetector] mss init failed: {exc}")
+    # ── Background loop ───────────────────────────────────────────────────────
 
-        if self._backend == "none":
-            print("[MeterDetector] No capture backend available — install dxcam or mss.")
-            return False
-
+    def start(self, fps: int = 120) -> None:
+        """Launch a daemon detection loop at the requested frame rate."""
+        if self._running:
+            return
         self._running = True
-        self._thread = threading.Thread(
-            target=self._poll_loop, name="meter-detector", daemon=True
+        interval = 1.0 / fps
+        t = threading.Thread(
+            target=self._loop,
+            args=(interval,),
+            daemon=True,
+            name="meter-detector",
         )
-        self._thread.start()
-        return True
+        t.start()
 
     def stop(self) -> None:
         self._running = False
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-        try:
-            if self._camera is not None:
-                del self._camera
-            if self._mss_ctx is not None:
-                self._mss_ctx.close()
-        except Exception:
-            pass
 
-    # ── Capture ───────────────────────────────────────────────────────────────
-
-    def _capture_bgr(self, cfg: MeterConfig) -> Optional[np.ndarray]:
-        """Grab the ROI as a BGR numpy array. Returns None on failure."""
-        if self._backend == "dxcam" and self._camera is not None:
-            try:
-                frame = self._camera.grab(region=cfg.roi)
-                return frame  # already BGR, or None if no new frame
-            except Exception:
-                return None
-
-        if self._backend == "mss" and self._mss_ctx is not None:
-            try:
-                mon = cfg.roi_mss()
-                shot = self._mss_ctx.grab(mon)
-                arr = np.array(shot)          # BGRA
-                return arr[:, :, :3]          # drop alpha
-            except Exception:
-                return None
-
-        return None
-
-    # ── Detection ─────────────────────────────────────────────────────────────
-
-    def _analyze(
-        self, bgr: np.ndarray, cfg: MeterConfig
-    ) -> tuple[float, bool, bool]:
-        """
-        Returns (fill_pct, fill_detected, green_detected).
-
-        Uses cv2.UMat (OpenCL) when an AMD/Nvidia/Intel GPU is available —
-        BGR→HSV conversion and inRange thresholding run on the GPU, only
-        the small result arrays are downloaded back to CPU.
-        """
-        h, w = bgr.shape[:2]
-        g_lo = np.array([cfg.green_h_lo, cfg.green_s_lo, cfg.green_v_lo], dtype=np.uint8)
-        g_hi = np.array([cfg.green_h_hi, 255, 255], dtype=np.uint8)
-
-        if _OCL_OK:
-            # ── GPU path (OpenCL via UMat — AMD RX 580 / any OpenCL 2.0 GPU) ──
-            bgr_u   = cv2.UMat(bgr)
-            hsv_u   = cv2.cvtColor(bgr_u, cv2.COLOR_BGR2HSV)
-
-            # Green zone mask
-            green_u = cv2.inRange(hsv_u, g_lo, g_hi)
-
-            # Brightness threshold for fill bar
-            _, _, v_u = cv2.split(hsv_u)
-            _, bright_u = cv2.threshold(v_u, cfg.fill_v_threshold, 255, cv2.THRESH_BINARY)
-
-            # Download only the small result arrays
-            green_mask  = green_u.get()
-            bright_mask = bright_u.get()
-        else:
-            # ── CPU path ────────────────────────────────────────────────────
-            hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-            green_mask  = cv2.inRange(hsv, g_lo, g_hi)
-            _, bright_mask = cv2.threshold(hsv[:, :, 2], cfg.fill_v_threshold, 255, cv2.THRESH_BINARY)
-
-        # ── Green zone detection ───────────────────────────────────────────
-        green_detected = bool(cv2.countNonZero(green_mask) > int(h * w * 0.02))
-
-        # ── Fill position (brightness row scan) ───────────────────────────
-        min_cols = max(1, int(w * cfg.min_col_fraction))
-        row_counts = (bright_mask > 0).sum(axis=1)
-        fill_rows  = np.where(row_counts >= min_cols)[0]
-
-        if len(fill_rows) == 0:
-            return 0.0, False, green_detected
-
-        topmost  = int(fill_rows.min())
-        fill_pct = max(0.0, min(1.0, (h - topmost) / h))
-        return fill_pct, True, green_detected
-
-    # ── Poll loop ─────────────────────────────────────────────────────────────
-
-    def _poll_loop(self) -> None:
-        interval = 1.0 / self._cfg.target_hz
-        deadline = time.perf_counter()
-
+    def _loop(self, interval: float) -> None:
+        import time as _time
         while self._running:
-            deadline += interval
-            now = time.perf_counter()
-            sleep_for = deadline - now
-            if sleep_for > 0.001:
-                time.sleep(sleep_for - 0.0005)
-            while time.perf_counter() < deadline:
-                pass
+            t0 = _time.perf_counter()
+            self.detect()
+            elapsed = _time.perf_counter() - t0
+            remaining = interval - elapsed
+            if remaining > 0:
+                _time.sleep(remaining)
 
-            with self._lock:
-                cfg = self._cfg
+    # ── Analysis ──────────────────────────────────────────────────────────────
 
-            bgr = self._capture_bgr(cfg)
-            if bgr is None:
-                continue
+    def _analyze(self, frame: np.ndarray) -> DetectionResult:
+        h, w = frame.shape[:2]
+        hsv  = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        r    = DetectionResult()
 
-            t = time.perf_counter()
-            fill_pct, fill_detected, green_detected = self._analyze(bgr, cfg)
+        # ── Green window detection ────────────────────────────────────────────
+        green_mask = cv2.inRange(hsv, _GREEN_LO, _GREEN_HI)
+        # Morphological open to kill noise
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_OPEN, kernel)
+        green_px = int(cv2.countNonZero(green_mask))
 
-            pos, vel_per_sec = self._kalman.update(fill_pct, t)
-            vel_per_ms = vel_per_sec / 1000.0
+        if green_px >= _MIN_GREEN_PX:
+            r.green_window_visible = True
+            r.confidence = min(1.0, green_px / 300.0)
+            M = cv2.moments(green_mask)
+            if M["m00"] > 0:
+                # cy normalised to frame height — arc fills from bottom upward
+                cy = M["m01"] / M["m00"]
+                r.green_window_pct = 1.0 - (cy / h)
 
-            snap = MeterSnapshot(
-                fill_pct=max(0.0, min(1.0, pos)),
-                velocity_pct_per_ms=max(0.0, vel_per_ms),
-                fill_detected=fill_detected,
-                green_detected=green_detected,
-                timestamp=t,
-            )
-            with self._lock:
-                self._snapshot = snap
+        # ── Meter fill detection ──────────────────────────────────────────────
+        white_mask = cv2.inRange(hsv, _WHITE_LO, _WHITE_HI)
+        white_px   = int(cv2.countNonZero(white_mask))
+
+        if white_px >= _MIN_WHITE_PX:
+            r.meter_found = True
+            # Topmost non-zero row → arc fill travels upward
+            rows_with_white = np.any(white_mask > 0, axis=1)
+            if rows_with_white.any():
+                top_row  = int(np.argmax(rows_with_white))
+                r.fill_pct = 1.0 - (top_row / h)
+
+        # ── Shot outcome detection ────────────────────────────────────────────
+        # Result text appears in the upper third of the capture region
+        result_roi  = hsv[: h // 3, :]
+        result_mask = cv2.inRange(result_roi, _RESULT_LO, _RESULT_HI)
+        if int(cv2.countNonZero(result_mask)) >= _MIN_RESULT_PX:
+            r.outcome_detected = True
+
+        # ── Debug visualisation ───────────────────────────────────────────────
+        if self._debug:
+            dbg = frame.copy()
+            dbg[green_mask > 0]  = [0,   255, 80]
+            dbg[white_mask > 0]  = [200, 200, 255]
+            r.debug_frame = dbg
+
+        return r

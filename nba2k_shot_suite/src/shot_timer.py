@@ -131,8 +131,12 @@ class ShotTimingEngine:
         """
         Feed the current XInput button bitmask on each poll.
         Detects X-button rising and falling edges (digital — no threshold).
+        Callbacks are invoked AFTER releasing self._lock to avoid lock-ordering
+        issues with the HBR lock and the VirtualController lock.
         """
         shooting = bool(buttons & self.SHOOT_BUTTON)
+        post_hold    = False
+        post_label   = ""
 
         with self._lock:
             was_active = self._shot_active
@@ -144,13 +148,23 @@ class ShotTimingEngine:
                 self._shot_start = time.perf_counter()
                 self._cancel_event.clear()
                 self._launch_timer(profile)
-                self._notify("SHOT ARMED")
+                post_hold  = True
+                post_label = "SHOT ARMED"
 
             elif not shooting and was_active:
                 # Falling edge before timer fired — emergency release
                 self._shot_active = False
                 self._cancel_event.set()
-                self._notify("EARLY RELEASE")
+                post_label = "EARLY RELEASE"
+
+        # Invoke callbacks outside the lock (VirtualController has its own lock)
+        if post_hold:
+            try:
+                self._on_hold()
+            except Exception as exc:
+                print(f"[ShotTimer] hold callback error: {exc}")
+        if post_label:
+            self._notify(post_label)
 
     def _launch_timer(self, profile: JumpShotProfile) -> None:
         """Spawn a fire-and-forget thread targeting the green window."""

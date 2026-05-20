@@ -1,138 +1,94 @@
-# src/config_manager.py
 """
-Configuration manager with persistent storage and live object updates.
-Tracks shot profiles, learning data, and HBR parameters.
+Persistent configuration manager.
+
+Loads/saves config.json; exposes live-update hooks so the web dashboard
+can apply changes to running HBR and ShotTimingEngine instances.
 """
 from __future__ import annotations
 
 import json
 import threading
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .hbr import HumanButtonResponder
+    from .shot_timer import ShotTimingEngine
+
 
 @dataclass
-class ShotLearningProfile:
-    """Per-player timing learning data."""
-    player_name: str
-    animation_ms: float
-    
-    # Adaptive offset (learned timing correction in ms)
-    offset_ms: float = 0.0
-    offset_sigma: float = 8.0  # uncertainty in offset estimate
-    
-    # Timing history (rolling window of last N shots)
-    release_errors: list[float] = None  # actual_time - optimal_time
-    green_rate: float = 0.0  # greens / total shots
-    total_shots: int = 0
-    
-    def __post_init__(self):
-        if self.release_errors is None:
-            self.release_errors = []
-    
-    def record_shot(self, error_ms: float, was_green: bool) -> None:
-        """Record actual vs. expected release timing."""
-        self.release_errors.append(error_ms)
-        if len(self.release_errors) > 100:  # keep last 100 shots
-            self.release_errors.pop(0)
-        
-        self.total_shots += 1
-        if was_green:
-            self.green_rate = (self.green_rate * (self.total_shots - 1) + 1.0) / self.total_shots
-        else:
-            self.green_rate = (self.green_rate * (self.total_shots - 1)) / self.total_shots
+class Config:
+    active_profile:  str   = "default"
+    animation_ms:    float = 800.0
+    green_start_pct: float = 0.55
+    green_end_pct:   float = 0.65
+    aim_percentile:  float = 0.50
 
 
 class ConfigManager:
-    """
-    Manages configuration state and auto-saves to disk.
-    Supports live updates for registered objects (HBR, ShotTimingEngine, learning profiles).
-    """
-    
-    def __init__(self, config_path: Path) -> None:
-        self._path = config_path
-        self._lock = threading.Lock()
-        self._data: dict[str, Any] = {}
-        self._learning_profiles: dict[str, ShotLearningProfile] = {}
-        self._observers: list[Any] = []  # objects to update on config change
-        
+    def __init__(self, path: Path) -> None:
+        self._path  = path
+        self._lock  = threading.Lock()
+        self._cfg   = Config()
+        self._hbr:    Optional[Any] = None
+        self._engine: Optional[Any] = None
         self._load()
-    
+
+    # ── Registration ──────────────────────────────────────────────────────────
+
+    def register(self, hbr: Any, engine: Any) -> None:
+        self._hbr    = hbr
+        self._engine = engine
+
+    # ── Read / write ──────────────────────────────────────────────────────────
+
+    def get(self) -> Config:
+        with self._lock:
+            return self._cfg
+
+    def apply_dict(self, data: dict[str, Any]) -> None:
+        with self._lock:
+            for k, v in data.items():
+                if hasattr(self._cfg, k):
+                    setattr(self._cfg, k, v)
+            self._persist()
+            self._push_to_components()
+
+    # ── Internal ──────────────────────────────────────────────────────────────
+
     def _load(self) -> None:
-        """Load config from disk, or create defaults."""
-        if self._path.exists():
-            try:
-                with open(self._path, 'r') as f:
-                    saved = json.load(f)
-                    self._data = saved.get('config', {})
-                    
-                    # Restore learning profiles
-                    for name, profile_data in saved.get('learning_profiles', {}).items():
-                        profile = ShotLearningProfile(**profile_data)
-                        self._learning_profiles[name] = profile
-            except Exception as e:
-                print(f"[ConfigManager] Load failed: {e} — using defaults")
-        
-        # Ensure essential keys exist
-        self._data.setdefault('active_profile', 'default')
-        self._data.setdefault('animation_ms', 800.0)
-        self._data.setdefault('green_start_pct', 0.55)
-        self._data.setdefault('green_end_pct', 0.65)
-        self._data.setdefault('aim_percentile', 0.50)
-        self._data.setdefault('auto_shoot_mode', False)
-        self._data.setdefault('learning_enabled', True)
-        self._save()
-    
-    def register(self, *objects: Any) -> None:
-        """Register live objects to receive config updates."""
-        with self._lock:
-            self._observers.extend(objects)
-    
-    def get(self) -> dict[str, Any]:
-        """Get current config dict (thread-safe snapshot)."""
-        with self._lock:
-            return dict(self._data)
-    
-    def apply_dict(self, updates: dict[str, Any]) -> None:
-        """Apply updates and notify observers."""
-        with self._lock:
-            self._data.update(updates)
-            
-            # Notify registered objects of changes
-            for obs in self._observers:
-                if hasattr(obs, 'update_profile'):
-                    obs.update_profile(updates)
-        
-        self._save()
-    
-    def get_learning_profile(self, player_name: str) -> ShotLearningProfile:
-        """Get or create learning profile for a player."""
-        with self._lock:
-            if player_name not in self._learning_profiles:
-                self._learning_profiles[player_name] = ShotLearningProfile(
-                    player_name=player_name,
-                    animation_ms=self._data.get('animation_ms', 800.0),
-                )
-            return self._learning_profiles[player_name]
-    
-    def record_shot(self, player_name: str, error_ms: float, was_green: bool) -> None:
-        """Record a shot attempt for learning."""
-        profile = self.get_learning_profile(player_name)
-        profile.record_shot(error_ms, was_green)
-        self._save()
-    
-    def _save(self) -> None:
-        """Persist config to disk."""
+        if not self._path.exists():
+            return
         try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            data = {
-                'config': self._data,
-                'learning_profiles': {
-                    name: asdict(profile)
-                    for name, profile in self._learning_profiles.items()
-                }
-            }
-            with open(self._path, 'w') as f:
-                json.dump(data, f, indent=2)
-        except Exception as e:
-            print(f"[ConfigManager] Save failed: {e}")
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+            for k, v in data.items():
+                if hasattr(self._cfg, k):
+                    setattr(self._cfg, k, v)
+        except Exception as exc:
+            print(f"[Config] load error (using defaults): {exc}")
+
+    def _persist(self) -> None:
+        try:
+            self._path.write_text(
+                json.dumps(asdict(self._cfg), indent=2),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            print(f"[Config] save error: {exc}")
+
+    def _push_to_components(self) -> None:
+        """Apply current config to live engine/hbr if registered."""
+        cfg = self._cfg
+        if self._engine is not None:
+            from .shot_timer import JumpShotProfile
+            try:
+                self._engine.set_profile(JumpShotProfile(
+                    name            = cfg.active_profile,
+                    animation_ms    = cfg.animation_ms,
+                    green_start_pct = cfg.green_start_pct,
+                    green_end_pct   = cfg.green_end_pct,
+                    aim_percentile  = cfg.aim_percentile,
+                ))
+            except Exception as exc:
+                print(f"[Config] engine update error: {exc}")

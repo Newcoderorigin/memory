@@ -39,9 +39,6 @@ except ImportError:
     _VGAMEPAD_OK = False
     _BUTTON_MAP = {}
 
-# RT bitmask — we intercept this for shot timing
-_RT_THRESHOLD_BYTE = 217  # ≈ 0.85 × 255
-
 
 class VirtualController:
     """
