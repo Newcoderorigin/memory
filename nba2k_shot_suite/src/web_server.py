@@ -6,6 +6,7 @@ Routes:
   GET /state    — raw JSON state snapshot
   GET /frame    — latest annotated detection frame (JPEG, ~10 FPS in browser)
   POST /config  — apply config patch (JSON body)
+  POST /toggle  — flip auto-green ON/OFF  (body: {"enabled": true|false})
   GET /profiles — all built-in profiles as JSON
 """
 from __future__ import annotations
@@ -16,6 +17,7 @@ from typing import Any, Optional
 _state:    dict[str, Any] = {}
 _lock      = threading.Lock()
 _detector: Optional[Any]  = None   # set by start_web_server
+_engine:   Optional[Any]  = None   # set by start_web_server
 
 
 def push_state(state: dict[str, Any]) -> None:
@@ -51,6 +53,11 @@ h1{font-size:1.15rem;color:#00ff88;margin-bottom:14px;letter-spacing:.06em}
 .toggle-badge{display:inline-block;padding:3px 10px;border-radius:12px;font-size:.75rem;font-weight:bold;margin-left:8px}
 .toggle-on{background:#003322;color:#00ff88;border:1px solid #00ff8844}
 .toggle-off{background:#1a1a1a;color:#556;border:1px solid #333}
+.toggle-btn{display:block;width:100%;padding:14px;border-radius:10px;font-size:1.1rem;font-weight:bold;
+            letter-spacing:.08em;cursor:pointer;border:2px solid;margin-bottom:14px;transition:all .15s}
+.toggle-btn-on{background:#003322;color:#00ff88;border-color:#00ff88;box-shadow:0 0 18px #00ff8833}
+.toggle-btn-off{background:#12121f;color:#445;border-color:#333}
+.toggle-btn:active{transform:scale(.97)}
 .frame-card{background:#0f0f22;border:1px solid #222244;border-radius:8px;padding:12px}
 .frame-card h2{font-size:.7rem;color:#5566aa;text-transform:uppercase;letter-spacing:.12em;margin-bottom:8px}
 #liveFrame{width:100%;border-radius:4px;display:block;max-height:320px;object-fit:contain;background:#000}
@@ -62,6 +69,10 @@ h1{font-size:1.15rem;color:#00ff88;margin-bottom:14px;letter-spacing:.06em}
   <span id="toggleBadge" class="toggle-badge toggle-off">AUTO OFF</span>
 </h1>
 <div id="eventBanner" class="event-banner"></div>
+
+<button id="toggleBtn" class="toggle-btn toggle-btn-off" onclick="doToggle()">
+  ○ AUTO-GREEN: OFF — click to enable
+</button>
 
 <div class="grid" id="grid"></div>
 
@@ -77,24 +88,51 @@ const pct  = v => ((v||0)*100).toFixed(1)+'%';
 const fmt  = v => (v===undefined||v===null)?'—':v;
 const clamp = (v,lo,hi)=>Math.max(lo,Math.min(hi,v));
 
+let _toggling = false;
+
+async function doToggle(){
+  if(_toggling) return;
+  _toggling = true;
+  const btn = document.getElementById('toggleBtn');
+  const isOn = btn.classList.contains('toggle-btn-on');
+  try{
+    const r = await fetch('/toggle', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({enabled: !isOn})
+    });
+    if(!r.ok) console.error('toggle failed', await r.text());
+  } catch(e){ console.error(e); }
+  _toggling = false;
+  await refreshState();
+}
+
+function _applyToggleBtn(autoOn){
+  const btn = document.getElementById('toggleBtn');
+  const badge = document.getElementById('toggleBadge');
+  if(autoOn){
+    btn.textContent = '⚡ AUTO-GREEN: ON — click to disable';
+    btn.className = 'toggle-btn toggle-btn-on';
+    badge.textContent='AUTO ON'; badge.className='toggle-badge toggle-on';
+  } else {
+    btn.textContent = '○ AUTO-GREEN: OFF — click to enable';
+    btn.className = 'toggle-btn toggle-btn-off';
+    badge.textContent='AUTO OFF'; badge.className='toggle-badge toggle-off';
+  }
+}
+
 async function refreshState(){
   try{
     const s = await (await fetch('/state')).json();
 
-    // Toggle badge
-    const badge = document.getElementById('toggleBadge');
-    if(s.auto_mode){
-      badge.textContent='AUTO ON'; badge.className='toggle-badge toggle-on';
-    } else {
-      badge.textContent='AUTO OFF'; badge.className='toggle-badge toggle-off';
-    }
+    _applyToggleBtn(s.auto_mode);
 
     // Event banner
     const banner = document.getElementById('eventBanner');
     if(s.event) banner.textContent = s.event;
     else if(s.shot_active) banner.textContent = '⚡ SHOT ARMED';
     else if(s.outcome_detected) banner.textContent = '✓ EXCELLENT';
-    else banner.textContent = s.auto_mode ? '● Auto mode active — waiting for shot' : '○ Hold X 3s to enable auto mode';
+    else banner.textContent = s.auto_mode ? '● Auto mode active — waiting for shot…' : '○ Auto-green OFF — click the button above to enable';
 
     // Meter bar values
     const fill  = clamp(s.fill_pct||0,0,1);
@@ -170,15 +208,17 @@ setInterval(refreshFrame, 100);
 
 
 def start_web_server(
-    config_mgr: Any,
-    suite:      Any,
-    host:       str  = "127.0.0.1",
-    port:       int  = 8420,
+    config_mgr:   Any,
+    suite:        Any,
+    host:         str  = "127.0.0.1",
+    port:         int  = 8420,
     open_browser: bool = True,
-    detector:   Optional[Any] = None,
+    detector:     Optional[Any] = None,
+    engine:       Optional[Any] = None,
 ) -> None:
-    global _detector
+    global _detector, _engine
     _detector = detector
+    _engine   = engine
 
     try:
         from fastapi import FastAPI, Request
@@ -220,6 +260,18 @@ def start_web_server(
                 data = await request.json()
                 config_mgr.apply_dict(data)
                 return JSONResponse({"ok": True})
+            except Exception as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+        @app.post("/toggle")
+        async def post_toggle(request: Request) -> JSONResponse:
+            if _engine is None:
+                return JSONResponse({"ok": False, "error": "engine not available"}, status_code=503)
+            try:
+                data = await request.json()
+                enabled = bool(data.get("enabled", False))
+                _engine.set_auto_mode(enabled)
+                return JSONResponse({"ok": True, "auto_mode": enabled})
             except Exception as exc:
                 return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 

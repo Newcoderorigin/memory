@@ -95,23 +95,28 @@ class ShotTimingEngine:
     Monitors the Xbox X button (digital) and fires a timed release at the
     green window, using QPC busy-wait precision and HBR jitter.
 
+    This is the Python equivalent of a Cronus Zen GPC combo:
+      Cronus:  user presses RT → set_val(RT, 100) → wait(N ms) → set_val(RT, 0)
+      Us:      user presses X  → press_x() on vpad → _fire_at(release_ms) → release_x()
+
     Auto mode
     ─────────
-    Starts OFF (pass-through).  Hold X for 3 seconds to toggle ON/OFF.
-    A notification fires via on_event so the overlay can flash the state.
+    Starts OFF.  Toggled via the web dashboard (recommended) or by holding
+    X for 3 seconds in-game as a fallback.
 
-    When ON:  X press is intercepted → timed release at green window.
+    When ON:  every X press is intercepted → timed auto-release at green window.
     When OFF: X passes through unchanged — normal manual shooting.
+
+    set_auto_mode(True/False) — called by the web dashboard toggle button.
 
     One-armed-per-press guard
     ─────────────────────────
-    Prevents re-arming if the user holds X past the animation length
-    (which happens during the 3-second toggle hold).  A new shot is only
-    armed on the FIRST frame of each physical X press.
+    Prevents re-arming during a continuous X hold (e.g. when user holds X
+    past the animation length, or during the 3-second toggle window).
 
-    on_hold()    — called when X is pressed; caller presses X on virtual pad.
-    on_release() — called at the computed green window; caller releases X.
-    on_event(label) — optional notification callback (overlay / dashboard).
+    on_hold()       — called when X press is intercepted; caller presses X on vpad.
+    on_release()    — called at the green window; caller releases X on vpad.
+    on_event(label) — notification callback (overlay / dashboard).
     """
 
     SHOOT_BUTTON: int = 0x4000   # BTN_X — digital, no threshold needed
@@ -136,11 +141,11 @@ class ShotTimingEngine:
         self._cancel_event = threading.Event()
         self._timer_thread: Optional[threading.Thread] = None
 
-        # Toggle state
-        self._auto_mode:           bool            = False
-        self._x_press_time:        Optional[float] = None
-        self._toggle_fired:        bool            = False
-        self._shot_armed_this_press: bool          = False  # one shot per physical press
+        # Toggle state (OFF by default — enable via dashboard or 3-sec hold)
+        self._auto_mode:             bool            = False
+        self._x_press_time:          Optional[float] = None
+        self._toggle_fired:          bool            = False
+        self._shot_armed_this_press: bool            = False
 
     def set_profile(self, profile: JumpShotProfile) -> None:
         with self._lock:
@@ -166,6 +171,23 @@ class ShotTimingEngine:
         """
         with self._lock:
             return self._auto_mode and self._shot_active
+
+    def set_auto_mode(self, enabled: bool) -> None:
+        """
+        Enable or disable shot interception from outside (web dashboard toggle).
+        If disabling while a shot is in flight, the in-flight shot is cancelled
+        and the virtual X is released immediately.
+        """
+        post_label = ""
+        with self._lock:
+            if self._auto_mode == enabled:
+                return
+            self._auto_mode = enabled
+            if not enabled and self._shot_active:
+                self._shot_active = False
+                self._cancel_event.set()
+            post_label = f"AUTO {'ON ✓' if enabled else 'OFF ✗'}"
+        self._notify(post_label)
 
     def on_snapshot(self, buttons: int) -> None:
         """

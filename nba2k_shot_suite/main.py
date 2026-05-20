@@ -195,8 +195,14 @@ class ShotSuite:
     # ── Shot engine callbacks ─────────────────────────────────────────────────
 
     def _on_shot_hold(self) -> None:
-        # Snapshot the learner's current recommendation so we can log it later
-        self._shot_aim_pct = self._learner.aim_percentile
+        # Snapshot ONE aim_percentile draw here and use it for BOTH the engine
+        # profile and the learner record. Two separate calls to
+        # learner.aim_percentile may return different Thompson samples —
+        # that would corrupt the learning signal.
+        aim = self._learner.aim_percentile
+        self._shot_aim_pct = aim
+        # Apply this specific aim to the engine so _fire_at uses the same value
+        self._sync_learner_to_engine(aim_override=aim)
         if not self._args.display_only:
             self._vpad.press_x()
         if self._overlay:
@@ -273,16 +279,22 @@ class ShotSuite:
                                  aim_pct=self._shot_aim_pct)
             self._sync_learner_to_engine()
 
-    def _sync_learner_to_engine(self) -> None:
-        """Apply the learner's current μ as the engine aim_percentile."""
+    def _sync_learner_to_engine(self, aim_override: Optional[float] = None) -> None:
+        """Apply the learner's current aim as the engine profile.
+
+        aim_override: use this exact value instead of drawing a new sample
+        (prevents double Thompson-sampling — caller must pass the same value
+        it already drew for the shot record).
+        """
         cfg = self._config.get()
+        aim = aim_override if aim_override is not None else self._learner.mu
         try:
             profile = JumpShotProfile(
                 name             = cfg.active_profile,
                 animation_ms     = cfg.animation_ms,
                 green_start_pct  = cfg.green_start_pct,
                 green_end_pct    = cfg.green_end_pct,
-                aim_percentile   = self._learner.aim_percentile,
+                aim_percentile   = aim,
             )
             self._engine.set_profile(profile)
         except Exception as exc:
@@ -297,9 +309,10 @@ class ShotSuite:
                 print("[Suite] Game window not found — using default capture region. "
                       "Launch NBA 2K26 and restart, or drag the overlay to the meter.")
 
-        # Start web dashboard (pass detector for /frame live feed)
+        # Start web dashboard (pass detector for /frame, engine for /toggle)
         start_web_server(config_mgr=self._config, suite=self,
                          detector=self._detector,
+                         engine=self._engine,
                          host="127.0.0.1", port=self._args.port)
 
         # Start detection loop (120 FPS)
