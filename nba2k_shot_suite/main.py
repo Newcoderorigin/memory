@@ -115,9 +115,12 @@ class ShotSuite:
         )
         self._learner  = AdaptiveTimingLearner(save_path=_LEARNER_PATH)
 
-        # Shot tracking — records aim_pct used per shot for learner feedback
-        self._shot_aim_pct: float = initial_profile.aim_percentile
-        self._shot_fired   = threading.Event()
+        # Shot outcome tracking — one record per shot, with timing window
+        self._shot_aim_pct:       float          = initial_profile.aim_percentile
+        self._shot_release_time:  Optional[float] = None   # perf_counter at release
+        self._shot_release_fill:  float          = 0.0    # fill_pct at release
+        self._outcome_pending:    bool           = False   # waiting for screen result
+        self._outcome_window_end: float          = 0.0    # deadline to give up
 
         # ── Config wiring ─────────────────────────────────────────────────────
         self._config.register(self._hbr, self._engine)
@@ -148,6 +151,7 @@ class ShotSuite:
             "rx":              round(snap.rx, 3),
             "ry":              round(snap.ry, 3),
             "shot_active":     self._engine.shot_active,
+            "auto_mode":       self._engine.auto_mode,
             "current_profile": cfg.active_profile,
             "vpad_available":  self._vpad.available,
             "event":           "",
@@ -168,16 +172,17 @@ class ShotSuite:
     # ── XInput callbacks (poll thread) ────────────────────────────────────────
 
     def _on_state_change(self, snap: ControllerSnapshot) -> None:
-        shot_active = bool(snap.buttons & ShotTimingEngine.SHOOT_BUTTON)
-
-        # 1 — shot engine
+        # 1 — shot engine (must run before passthrough to set owns_x correctly)
         self._engine.on_snapshot(snap.buttons)
 
-        # 2 — passthrough (X excluded when shot timer owns it)
+        # 2 — passthrough
+        #   override_x=True only when engine currently owns the X button
+        #   (auto mode is ON and a shot is in flight).  When auto mode is OFF
+        #   X passes through normally so manual shooting works unchanged.
         if not self._args.display_only:
             self._vpad.passthrough(
                 snap,
-                override_x     = shot_active,
+                override_x     = self._engine.owns_x,
                 stick_noise_fn = self._hbr.stick_drift,
             )
 
@@ -203,8 +208,12 @@ class ShotSuite:
     def _on_shot_release(self) -> None:
         if not self._args.display_only:
             self._vpad.release_x()
-        # Signal detection loop that a shot just fired
-        self._shot_fired.set()
+        # Snapshot fill at release time so learner can infer early/late
+        # without relying on fill_pct from a later detection frame
+        self._shot_release_fill  = self._detector.latest.fill_pct
+        self._shot_release_time  = time.perf_counter()
+        self._outcome_pending    = True
+        self._outcome_window_end = self._shot_release_time + 2.5
         if self._overlay:
             try:
                 self._overlay.flash_green()
@@ -225,26 +234,44 @@ class ShotSuite:
             except Exception:
                 pass
 
-        # If a shot was fired recently, use the detected outcome for learning
-        if self._shot_fired.is_set():
-            outcome = "unknown"
-            if result.outcome_detected:
-                outcome = "green"
-            elif result.fill_pct < 0.4:
+        # ── Outcome detection for learner ─────────────────────────────────────
+        # Cronus-style scripts are blind; we wait for the screen to confirm.
+        # "Excellent" text takes 250–500 ms to appear after release, so we
+        # NEVER classify on fill_pct in the first 250 ms — that's the bug that
+        # caused green rate to drop (early misclassification before text appeared).
+        if not self._outcome_pending or self._shot_release_time is None:
+            return
+
+        now     = time.perf_counter()
+        elapsed = now - self._shot_release_time
+
+        # Too soon — outcome text hasn't rendered yet
+        if elapsed < 0.25:
+            return
+
+        # Window expired — use fill_pct snapshot from moment of release as fallback
+        if now > self._outcome_window_end:
+            self._outcome_pending = False
+            fill = self._shot_release_fill
+            if fill < 0.45:
                 outcome = "early"
-            elif result.fill_pct > 0.85:
+            elif fill > 0.80:
                 outcome = "late"
+            else:
+                return   # release was in a plausible range but no text — skip
+            self._learner.record(outcome=outcome,
+                                 release_pct=self._shot_aim_pct,
+                                 aim_pct=self._shot_aim_pct)
+            self._sync_learner_to_engine()
+            return
 
-            if outcome != "unknown":
-                self._learner.record(
-                    outcome     = outcome,
-                    release_pct = self._shot_aim_pct,
-                    aim_pct     = self._shot_aim_pct,
-                )
-                self._shot_fired.clear()
-
-                # Push learner's updated aim back into the engine profile
-                self._sync_learner_to_engine()
+        # Screen confirms the result — highest-priority signal
+        if result.outcome_detected:
+            self._outcome_pending = False
+            self._learner.record(outcome="green",
+                                 release_pct=self._shot_aim_pct,
+                                 aim_pct=self._shot_aim_pct)
+            self._sync_learner_to_engine()
 
     def _sync_learner_to_engine(self) -> None:
         """Apply the learner's current μ as the engine aim_percentile."""
@@ -270,8 +297,9 @@ class ShotSuite:
                 print("[Suite] Game window not found — using default capture region. "
                       "Launch NBA 2K26 and restart, or drag the overlay to the meter.")
 
-        # Start web dashboard
+        # Start web dashboard (pass detector for /frame live feed)
         start_web_server(config_mgr=self._config, suite=self,
+                         detector=self._detector,
                          host="127.0.0.1", port=self._args.port)
 
         # Start detection loop (120 FPS)
@@ -347,6 +375,7 @@ class ShotSuite:
             f"  Controller slot  : {self._args.controller}\n"
             f"  Poll rate        : {self._args.poll_hz} Hz\n"
             f"  Shot button      : X (digital)\n"
+            f"  Auto mode        : OFF  ← hold X for 3 sec to toggle ON\n"
             f"  Profile          : {cfg.active_profile}\n"
             f"  Animation        : {cfg.animation_ms:.0f} ms\n"
             f"  Release target   : {p.release_ms:.0f} ms after X press\n"

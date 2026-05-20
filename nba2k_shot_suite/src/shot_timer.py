@@ -86,14 +86,32 @@ PROFILES: dict[str, JumpShotProfile] = {
 }
 
 
+# Seconds X must be held continuously to toggle auto mode on/off
+_TOGGLE_HOLD_SECS = 3.0
+
+
 class ShotTimingEngine:
     """
     Monitors the Xbox X button (digital) and fires a timed release at the
     green window, using QPC busy-wait precision and HBR jitter.
 
+    Auto mode
+    ─────────
+    Starts OFF (pass-through).  Hold X for 3 seconds to toggle ON/OFF.
+    A notification fires via on_event so the overlay can flash the state.
+
+    When ON:  X press is intercepted → timed release at green window.
+    When OFF: X passes through unchanged — normal manual shooting.
+
+    One-armed-per-press guard
+    ─────────────────────────
+    Prevents re-arming if the user holds X past the animation length
+    (which happens during the 3-second toggle hold).  A new shot is only
+    armed on the FIRST frame of each physical X press.
+
     on_hold()    — called when X is pressed; caller presses X on virtual pad.
     on_release() — called at the computed green window; caller releases X.
-    on_event(label) — optional notification callback (e.g. for web dashboard).
+    on_event(label) — optional notification callback (overlay / dashboard).
     """
 
     SHOOT_BUTTON: int = 0x4000   # BTN_X — digital, no threshold needed
@@ -106,58 +124,104 @@ class ShotTimingEngine:
         on_release: Callable[[], None],
         on_event: Optional[Callable[[str], None]] = None,
     ) -> None:
-        self._profile = profile
-        self._hbr = hbr
-        self._on_hold = on_hold
+        self._profile    = profile
+        self._hbr        = hbr
+        self._on_hold    = on_hold
         self._on_release = on_release
-        self._on_event = on_event
+        self._on_event   = on_event
 
-        self._lock = threading.Lock()
-        self._shot_active = False
-        self._shot_start: float = 0.0
+        self._lock         = threading.Lock()
+        self._shot_active  = False
+        self._shot_start:  float = 0.0
         self._cancel_event = threading.Event()
         self._timer_thread: Optional[threading.Thread] = None
+
+        # Toggle state
+        self._auto_mode:           bool            = False
+        self._x_press_time:        Optional[float] = None
+        self._toggle_fired:        bool            = False
+        self._shot_armed_this_press: bool          = False  # one shot per physical press
 
     def set_profile(self, profile: JumpShotProfile) -> None:
         with self._lock:
             self._profile = profile
 
     @property
+    def auto_mode(self) -> bool:
+        """Whether the engine is currently intercepting shots."""
+        with self._lock:
+            return self._auto_mode
+
+    @property
     def shot_active(self) -> bool:
         with self._lock:
             return self._shot_active
 
+    @property
+    def owns_x(self) -> bool:
+        """
+        True while the engine holds X on the virtual pad (auto mode + shot
+        in flight).  main.py uses this to block X from passthrough so the
+        physical release cannot interfere with the timed release.
+        """
+        with self._lock:
+            return self._auto_mode and self._shot_active
+
     def on_snapshot(self, buttons: int) -> None:
         """
         Feed the current XInput button bitmask on each poll.
-        Detects X-button rising and falling edges (digital — no threshold).
-        Callbacks are invoked AFTER releasing self._lock to avoid lock-ordering
-        issues with the HBR lock and the VirtualController lock.
+        All callbacks are invoked AFTER releasing self._lock to avoid
+        lock-ordering deadlocks with HBR and VirtualController.
         """
-        shooting = bool(buttons & self.SHOOT_BUTTON)
-        post_hold    = False
-        post_label   = ""
+        shooting   = bool(buttons & self.SHOOT_BUTTON)
+        post_hold  = False
+        post_label = ""
 
         with self._lock:
-            was_active = self._shot_active
-            profile = self._profile
+            # ── Toggle detection (always active, regardless of auto_mode) ─────
+            if shooting:
+                if self._x_press_time is None:
+                    self._x_press_time        = time.perf_counter()
+                    self._toggle_fired        = False
+                    self._shot_armed_this_press = False
 
-            if shooting and not was_active:
-                # Rising edge — shot starts
-                self._shot_active = True
-                self._shot_start = time.perf_counter()
-                self._cancel_event.clear()
-                self._launch_timer(profile)
-                post_hold  = True
-                post_label = "SHOT ARMED"
+                elif (not self._toggle_fired and
+                      time.perf_counter() - self._x_press_time >= _TOGGLE_HOLD_SECS):
+                    self._auto_mode    = not self._auto_mode
+                    self._toggle_fired = True
+                    # Cancel any in-flight shot so the toggle hold doesn't
+                    # keep a virtual X pressed on the vpad
+                    if self._shot_active:
+                        self._shot_active = False
+                        self._cancel_event.set()
+                    post_label = f"AUTO {'ON ✓' if self._auto_mode else 'OFF ✗'}"
+            else:
+                self._x_press_time          = None
+                self._toggle_fired          = False
+                self._shot_armed_this_press = False
 
-            elif not shooting and was_active:
-                # Falling edge before timer fired — emergency release
-                self._shot_active = False
-                self._cancel_event.set()
-                post_label = "EARLY RELEASE"
+            # ── Shot intercept (auto mode only; skip while waiting for toggle) ─
+            if self._auto_mode and not self._toggle_fired:
+                was_active = self._shot_active
+                profile    = self._profile
 
-        # Invoke callbacks outside the lock (VirtualController has its own lock)
+                if shooting and not was_active and not self._shot_armed_this_press:
+                    # Rising edge — arm shot (one per physical press)
+                    self._shot_active          = True
+                    self._shot_start           = time.perf_counter()
+                    self._shot_armed_this_press = True
+                    self._cancel_event.clear()
+                    self._launch_timer(profile)
+                    post_hold  = True
+                    post_label = post_label or "SHOT ARMED"
+
+                elif not shooting and was_active:
+                    # Physical release before timer — emergency release
+                    self._shot_active = False
+                    self._cancel_event.set()
+                    post_label = post_label or "EARLY RELEASE"
+
+        # Invoke callbacks outside lock (vpad has its own lock)
         if post_hold:
             try:
                 self._on_hold()

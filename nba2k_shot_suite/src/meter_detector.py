@@ -80,17 +80,24 @@ class MeterDetector:
         debug:   bool = False,
         on_result: Optional[Callable[[DetectionResult], None]] = None,
     ) -> None:
-        self._cap       = capture
-        self._debug     = debug
-        self._on_result = on_result
-        self._lock      = threading.Lock()
-        self._latest    = DetectionResult()
-        self._running   = False
+        self._cap            = capture
+        self._debug          = debug
+        self._on_result      = on_result
+        self._lock           = threading.Lock()
+        self._latest         = DetectionResult()
+        self._annotated_frame: Optional[np.ndarray] = None   # always generated
+        self._running        = False
 
     @property
     def latest(self) -> DetectionResult:
         with self._lock:
             return self._latest
+
+    def get_annotated_frame(self) -> Optional[np.ndarray]:
+        """Return the latest frame with detection overlays drawn on it."""
+        with self._lock:
+            f = self._annotated_frame
+            return f.copy() if f is not None else None
 
     # ── Single-frame detection ────────────────────────────────────────────────
 
@@ -101,9 +108,10 @@ class MeterDetector:
         frame = self._cap.grab()
         if frame is None:
             return DetectionResult()
-        result = self._analyze(frame)
+        result, annotated = self._analyze(frame)
         with self._lock:
-            self._latest = result
+            self._latest          = result
+            self._annotated_frame = annotated
         if self._on_result:
             try:
                 self._on_result(result)
@@ -142,51 +150,83 @@ class MeterDetector:
 
     # ── Analysis ──────────────────────────────────────────────────────────────
 
-    def _analyze(self, frame: np.ndarray) -> DetectionResult:
+    def _analyze(
+        self, frame: np.ndarray
+    ) -> tuple["DetectionResult", np.ndarray]:
+        """Returns (DetectionResult, annotated_frame)."""
         h, w = frame.shape[:2]
         hsv  = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         r    = DetectionResult()
 
         # ── Green window detection ────────────────────────────────────────────
         green_mask = cv2.inRange(hsv, _GREEN_LO, _GREEN_HI)
-        # Morphological open to kill noise
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        kernel     = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         green_mask = cv2.morphologyEx(green_mask, cv2.MORPH_OPEN, kernel)
-        green_px = int(cv2.countNonZero(green_mask))
+        green_px   = int(cv2.countNonZero(green_mask))
+        green_cx = green_cy = 0
 
         if green_px >= _MIN_GREEN_PX:
             r.green_window_visible = True
             r.confidence = min(1.0, green_px / 300.0)
             M = cv2.moments(green_mask)
             if M["m00"] > 0:
-                # cy normalised to frame height — arc fills from bottom upward
-                cy = M["m01"] / M["m00"]
-                r.green_window_pct = 1.0 - (cy / h)
+                green_cx = int(M["m10"] / M["m00"])
+                green_cy = int(M["m01"] / M["m00"])
+                r.green_window_pct = 1.0 - (green_cy / h)
 
         # ── Meter fill detection ──────────────────────────────────────────────
         white_mask = cv2.inRange(hsv, _WHITE_LO, _WHITE_HI)
         white_px   = int(cv2.countNonZero(white_mask))
+        top_row    = h
 
         if white_px >= _MIN_WHITE_PX:
             r.meter_found = True
-            # Topmost non-zero row → arc fill travels upward
             rows_with_white = np.any(white_mask > 0, axis=1)
             if rows_with_white.any():
-                top_row  = int(np.argmax(rows_with_white))
+                top_row    = int(np.argmax(rows_with_white))
                 r.fill_pct = 1.0 - (top_row / h)
 
         # ── Shot outcome detection ────────────────────────────────────────────
-        # Result text appears in the upper third of the capture region
         result_roi  = hsv[: h // 3, :]
         result_mask = cv2.inRange(result_roi, _RESULT_LO, _RESULT_HI)
         if int(cv2.countNonZero(result_mask)) >= _MIN_RESULT_PX:
             r.outcome_detected = True
 
-        # ── Debug visualisation ───────────────────────────────────────────────
-        if self._debug:
-            dbg = frame.copy()
-            dbg[green_mask > 0]  = [0,   255, 80]
-            dbg[white_mask > 0]  = [200, 200, 255]
-            r.debug_frame = dbg
+        # ── Annotated frame (always generated for dashboard /frame feed) ──────
+        ann = frame.copy()
 
-        return r
+        # White mask overlay (meter arc) — light blue tint
+        ann[white_mask > 0] = (ann[white_mask > 0] * 0.4 +
+                               np.array([255, 180, 60]) * 0.6).astype(np.uint8)
+
+        # Green mask overlay — bright green tint
+        ann[green_mask > 0] = (ann[green_mask > 0] * 0.2 +
+                               np.array([0, 255, 80]) * 0.8).astype(np.uint8)
+
+        # Green window centroid circle
+        if r.green_window_visible:
+            cv2.circle(ann, (green_cx, green_cy), 10, (0, 255, 80), 2)
+            cv2.circle(ann, (green_cx, green_cy), 3,  (0, 255, 80), -1)
+
+        # Fill level horizontal line
+        if r.meter_found:
+            cv2.line(ann, (0, top_row), (w, top_row), (100, 180, 255), 1)
+
+        # Outcome banner
+        if r.outcome_detected:
+            cv2.rectangle(ann, (0, 0), (w, 28), (0, 180, 60), -1)
+            cv2.putText(ann, "EXCELLENT", (6, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+
+        # HUD text (bottom-left)
+        hud = (f"fill:{r.fill_pct*100:.0f}%  "
+               f"gw:{r.green_window_pct*100:.0f}%  "
+               f"conf:{r.confidence:.2f}")
+        cv2.rectangle(ann, (0, h - 22), (w, h), (0, 0, 0), -1)
+        cv2.putText(ann, hud, (4, h - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 220, 255), 1)
+
+        if self._debug:
+            r.debug_frame = ann
+
+        return r, ann
