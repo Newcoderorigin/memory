@@ -1,0 +1,14 @@
+{
+  "config": {
+    "active_profile": "default",
+    "animation_ms": 800,
+    "green_start_pct": 0.55,
+    "green_end_pct": 0.65,
+    "aim_percentile": 0.5,
+    "auto_shoot_mode": false,
+    "learning_enabled": true,
+    "vision_mode": false,
+    "vision_latency_ms": 8.0
+  },
+  "learning_profiles": {}
+}

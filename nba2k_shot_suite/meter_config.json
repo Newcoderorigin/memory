@@ -1,0 +1,18 @@
+{
+  "roi": [
+    615,
+    607,
+    684,
+    712
+  ],
+  "fill_v_threshold": 92,
+  "min_col_fraction": 0.46,
+  "green_h_lo": 45,
+  "green_h_hi": 166,
+  "green_s_lo": 60,
+  "green_v_lo": 60,
+  "latency_ms": 8.0,
+  "kalman_Q": 0.02,
+  "kalman_R": 4.0,
+  "target_hz": 240
+}
