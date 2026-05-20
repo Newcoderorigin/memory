@@ -296,17 +296,30 @@ class ShotSuite:
             self._cleanup()
 
     def _start_overlay(self) -> None:
-        import tkinter as tk
-        from src.game_overlay import GameOverlay
+        try:
+            import tkinter as tk
+            from src.game_overlay import GameOverlay
+        except ImportError as exc:
+            print(
+                f"[Suite] Overlay disabled — tkinter unavailable ({exc}).\n"
+                "  Python 3.13 on Windows often ships with a broken _tkinter.dll.\n"
+                "  Fix: reinstall Python from python.org and tick 'tcl/tk and IDLE',\n"
+                "  or run with --no-overlay to suppress this message."
+            )
+            return
 
         _ready = threading.Event()
 
-        def _run():
-            root = tk.Tk()
-            self._overlay = GameOverlay(root)
-            root.geometry("+100+100")
-            _ready.set()
-            root.mainloop()
+        def _run() -> None:
+            try:
+                root = tk.Tk()
+                self._overlay = GameOverlay(root)
+                root.geometry("+100+100")
+                _ready.set()
+                root.mainloop()
+            except Exception as exc2:
+                print(f"[Suite] Overlay crashed: {exc2}")
+                _ready.set()
 
         t = threading.Thread(target=_run, daemon=True, name="overlay")
         t.start()

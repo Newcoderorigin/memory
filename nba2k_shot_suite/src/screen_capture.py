@@ -19,6 +19,10 @@ except ImportError:
     _MSS_OK = False
     print("[ScreenCapture] mss not installed. Run: pip install mss")
 
+# mss GDI contexts are thread-local — each thread that calls grab() needs its own
+# mss.mss() instance.  _tls.sct is created lazily on first use in each thread.
+_tls = threading.local()
+
 
 @dataclass
 class CaptureRegion:
@@ -46,31 +50,43 @@ class ScreenCapture:
     DEFAULT_REGION = CaptureRegion(left=700, top=480, width=520, height=480)
 
     def __init__(self, region: Optional[CaptureRegion] = None) -> None:
-        self._region = region or self.DEFAULT_REGION
-        self._lock   = threading.Lock()
-        self._sct: Optional[object] = mss.mss() if _MSS_OK else None
+        self._region      = region or self.DEFAULT_REGION
+        self._region_lock = threading.Lock()
 
     @property
     def available(self) -> bool:
-        return self._sct is not None
+        return _MSS_OK
+
+    def _sct(self) -> Optional[object]:
+        """Return (or create) this thread's mss instance."""
+        if not _MSS_OK:
+            return None
+        if not getattr(_tls, "sct", None):
+            _tls.sct = mss.mss()
+        return _tls.sct
 
     def grab(self) -> Optional[np.ndarray]:
         """
         Capture the current region → BGR uint8 ndarray, or None on failure.
-        Typical latency: 2–5 ms on a modern GPU with hardware composition.
+        Creates a per-thread mss context on first call — safe to call from
+        any thread.
         """
-        if not self._sct:
+        sct = self._sct()
+        if sct is None:
             return None
-        with self._lock:
-            try:
-                raw = self._sct.grab(self._region.as_mss())   # type: ignore[attr-defined]
-                return np.array(raw)[:, :, :3]                # BGRA → BGR
-            except Exception as exc:
-                print(f"[ScreenCapture] grab error: {exc}")
-                return None
+        with self._region_lock:
+            region = self._region.as_mss()
+        try:
+            raw = sct.grab(region)                 # type: ignore[attr-defined]
+            return np.array(raw)[:, :, :3]         # BGRA → BGR
+        except Exception as exc:
+            # Context may be stale after a screen layout change — reset it
+            _tls.sct = None
+            print(f"[ScreenCapture] grab error (context reset): {exc}")
+            return None
 
     def set_region(self, region: CaptureRegion) -> None:
-        with self._lock:
+        with self._region_lock:
             self._region = region
 
     def auto_locate(self) -> bool:
